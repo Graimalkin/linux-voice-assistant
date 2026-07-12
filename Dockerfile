@@ -1,52 +1,23 @@
-FROM python:3.13-slim-trixie
+### Multi-stage build: compile in a builder, ship only the runtime venv + libs.
+### Keeps build-essential (needed to compile pymicro-features) and vim OUT of the final
+### image, which slims it well below the single-stage build and — crucially — breaks up the
+### one giant apt layer that OOM-thrashed the 512MB Pi Zero 2 W satellites on pull.
 
-ENV LANG C.UTF-8
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+# ---------- builder: has the compilers, produces /app (incl. .venv) ----------
+FROM python:3.13-slim-trixie AS builder
 
-LABEL \
-    org.opencontainers.image.authors="Open Home Foundation" \
-    org.opencontainers.image.description="Voice assistant for Home Assistant" \
-    org.opencontainers.image.documentation="https://github.com/OHF-Voice/linux-voice-assistant/blob/main/README.md" \
-    org.opencontainers.image.licenses="Apache-2.0" \
-    org.opencontainers.image.source="https://github.com/OHF-Voice/linux-voice-assistant" \
-    org.opencontainers.image.title="Linux-Voice-Assistant" \
-    org.opencontainers.image.url="https://github.com/OHF-Voice/linux-voice-assistant"
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
 
-### Install packages:
-# - avahi-utils:        For zeroconf/mDNS discovery by Home Assistant
-# - pulseaudio-utils:   Required by soundcard library for audio I/O
-# - alsa-utils:         ALSA tools for audio device management
-# - pipewire-bin:       Required for pipewire support
-# - pipewire-alsa:      Required for pipewire support
-# - pipewire-pulse:     Required for pipewire support
-# - build-essential:    Required to compile pymicro-features
-# - libmpv-dev:         Required by python-mpv for audio playback
-# - libasound2-plugins: Required by python-mpv for audio playback
-# - ca-certificates:    For encrypted connections
-# - iproute2:           For ss command in entrypoint (port check)
-# - procps:             For pgrep in healthcheck
+# build-essential compiles pymicro-features; libmpv-dev + ca-certificates round out the build env.
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends \
-    avahi-utils \
-    pulseaudio-utils \
-    alsa-utils \
-    pipewire-bin \
-    pipewire-alsa \
-    pipewire-pulse \
     build-essential \
     libmpv-dev \
-    libasound2-plugins \
-    ca-certificates \
-    iproute2 \
-    vim \
-    procps && \
-apt-get clean
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-### Set workdir:
 WORKDIR /app
-
-### Copy all application files:
 COPY script/ ./script/
 COPY pyproject.toml ./
 COPY setup.cfg ./
@@ -56,13 +27,45 @@ COPY linux_voice_assistant/ ./linux_voice_assistant/
 COPY docker-entrypoint.sh ./
 COPY version.txt ./
 COPY version_githash.txt ./
-
-### Run installation:
 RUN chmod +x docker-entrypoint.sh
 RUN ./script/setup
 
-### Set ports for ESPHome API:
-EXPOSE 6053
+# ---------- runtime: slim, no compilers, no vim ----------
+FROM python:3.13-slim-trixie
 
-### Set start script:
+ENV LANG=C.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+LABEL \
+    org.opencontainers.image.authors="Open Home Foundation" \
+    org.opencontainers.image.description="Voice assistant for Home Assistant (wake-capture, slim)" \
+    org.opencontainers.image.licenses="Apache-2.0" \
+    org.opencontainers.image.source="https://github.com/OHF-Voice/linux-voice-assistant" \
+    org.opencontainers.image.title="Linux-Voice-Assistant"
+
+### Runtime-only packages (no build-essential, no vim):
+# - avahi-utils / pulseaudio-utils / alsa-utils / pipewire-*: audio + mDNS discovery
+# - libmpv2:            runtime mpv lib (python-mpv loads it via ctypes; no -dev headers needed)
+# - libasound2-plugins: python-mpv audio playback
+# - ca-certificates / iproute2 / procps: TLS, ss (entrypoint), pgrep (healthcheck)
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+    avahi-utils \
+    pulseaudio-utils \
+    alsa-utils \
+    pipewire-bin \
+    pipewire-alsa \
+    pipewire-pulse \
+    libmpv2 \
+    libasound2-plugins \
+    ca-certificates \
+    iproute2 \
+    procps && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app /app
+
+EXPOSE 6053
 ENTRYPOINT ["./docker-entrypoint.sh"]
