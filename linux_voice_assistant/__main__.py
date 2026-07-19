@@ -4,9 +4,13 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+from collections import deque
 from pathlib import Path
 from queue import Queue
 from typing import List, Optional, Union
@@ -37,6 +41,35 @@ _MODULE_DIR = Path(__file__).parent
 _REPO_DIR = _MODULE_DIR.parent
 _WAKEWORDS_DIR = _REPO_DIR / "wakewords"
 _SOUNDS_DIR = _REPO_DIR / "sounds"
+
+
+# --- wake-clip capture for the shadow verifier ------------------------------
+# Enabled only when WAKE_CAPTURE_URL is set. Fire-and-forget: never allowed to block or crash
+# the audio loop. Posts the ~WAKE_CAPTURE_SECONDS of PCM that triggered a wake to the scorer.
+_WAKE_CAPTURE_URL = os.environ.get("WAKE_CAPTURE_URL")
+_WAKE_CAPTURE_NAME = os.environ.get("WAKE_CAPTURE_NAME", "satellite")
+_WAKE_CAPTURE_SECONDS = float(os.environ.get("WAKE_CAPTURE_SECONDS", "1.6"))
+
+
+def _post_wake_clip(pcm: bytes, wake_word_name: str) -> None:
+    try:
+        q = urllib.parse.urlencode({"sat": _WAKE_CAPTURE_NAME, "ww": wake_word_name})
+        url = f"{_WAKE_CAPTURE_URL}?{q}"
+        req = urllib.request.Request(
+            url,
+            data=pcm,
+            method="POST",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        urllib.request.urlopen(req, timeout=4).read()
+    except Exception as e:  # never let capture break wake detection
+        _LOGGER.debug("wake-clip capture failed: %s", e)
+
+
+def _capture_wake_async(pcm: bytes, wake_word_name: str) -> None:
+    if not _WAKE_CAPTURE_URL or not pcm:
+        return
+    threading.Thread(target=_post_wake_clip, args=(pcm, wake_word_name), daemon=True).start()
 
 
 # -----------------------------------------------------------------------------
@@ -593,6 +626,11 @@ def process_audio(state: ServerState, mic, block_size: int):
     last_active: Optional[float] = None
     webrtc: Optional[WebRTCProcessor] = None
 
+    # Rolling audio ring for wake-clip capture (~_WAKE_CAPTURE_SECONDS of 16-bit PCM)
+    _cap_ring: "deque[bytes]" = deque()
+    _cap_bytes = 0
+    _cap_target = int(16000 * 2 * _WAKE_CAPTURE_SECONDS)
+
     try:
         _LOGGER.debug("Opening audio input device: %s", mic.name)
         with mic.recorder(samplerate=16000, channels=n_channels, blocksize=block_size) as mic_in:
@@ -626,6 +664,13 @@ def process_audio(state: ServerState, mic, block_size: int):
 
                 if state.satellite is None or not hasattr(state.satellite, "_is_streaming_audio"):
                     continue
+
+                # feed the wake-clip capture ring (bounded to ~_WAKE_CAPTURE_SECONDS)
+                if _WAKE_CAPTURE_URL:
+                    _cap_ring.append(audio_chunk)
+                    _cap_bytes += len(audio_chunk)
+                    while _cap_bytes > _cap_target and len(_cap_ring) > 1:
+                        _cap_bytes -= len(_cap_ring.popleft())
 
                 # WAKE WORD
                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
@@ -762,6 +807,11 @@ def process_audio(state: ServerState, mic, block_size: int):
                             if (last_active is None) or ((now - last_active) > state.refractory_seconds):
                                 state.satellite.wakeup(wake_word)
                                 last_active = now
+                                # capture the ~1.6s that triggered this wake (fire-and-forget)
+                                _capture_wake_async(
+                                    b"".join(_cap_ring),
+                                    getattr(wake_word, "wake_word", "?"),
+                                )
 
                     # Always process to keep state correct
                     stopped = False
